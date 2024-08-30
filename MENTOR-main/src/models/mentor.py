@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse import lil_matrix
@@ -11,6 +10,7 @@ from utils_package.utils import build_sim, compute_normalized_laplacian, build_k
 from torch_geometric.utils import remove_self_loops, add_self_loops, degree
 import torch_geometric
 
+import dashscope
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 from common.init import xavier_uniform_initialization
@@ -403,18 +403,31 @@ class MENTOR(GeneralRecommender):
 
 
     def forward(self, interaction,adj,train=False):
+        # self.v_feat:[7050, 512]  self.t_feat:[7050, 1536] self.entity_feat:[7050, 64]
+        # image_item_embeds:[7050, 64]  text_item_embeds:[7050, 64]
+        # self.v_rep:[26495, 64] self.t_rep:[26495, 64] self.id_rep:[26495, 64]
+        # extended_id_embeds:[26495, 64]
+        # explicit_image_item:[7050, 64] explicit_image_user:[19445, 64] explicit_image_embeds:[26495, 64]
+        # explicit_text_item:[7050, 64]  explicit_text_user:[19445, 64]  explicit_text_embeds:torch.Size([26495, 64])
+        # final_features:[26495, 64]
+        # representation:[26495, 192]
+        # user_rep:[19445, 192]
+        # item_rep:[7050, 192]
+        # self.user_rep:[19445, 256]
+        # self.item_rep:[7050, 256]
+        # self.result_embed:[26495, 256]
         user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
         pos_item_nodes += self.n_users
         neg_item_nodes += self.n_users
-
+    
         image_item_embeds = torch.multiply(self.item_id_embedding.weight, self.image_space_trans(self.v_feat))
         text_item_embeds = torch.multiply(self.item_id_embedding.weight, self.text_space_trans(self.t_feat))
-
+    
         # GCN for id, v, t modalities
         self.v_rep, self.v_preference = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat)
         self.t_rep, self.t_preference = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat)
-        self.id_rep, self.id_preference = self.id_gcn(self.edge_index_dropt, self.edge_index, self.id_feat)
-
+        self.id_rep, self.id_preference = self.id_gcn(self.edge_index_dropt, self.edge_index, self.id_feat + self.entity_feat)
+       
         #得到扩展图的id
         item_embeds = self.item_id_embedding.weight
         user_embeds = self.user_embedding.weight
@@ -422,18 +435,30 @@ class MENTOR(GeneralRecommender):
         extended_id_embeds = self.conv_ui(adj, user_embeds,item_embeds)
 
         explicit_image_item = self.conv_ii(self.image_original_adj, image_item_embeds)
+        print('explicit_image_item:')
+        print(explicit_image_item.shape)
         explicit_image_user = torch.sparse.mm(self.R, explicit_image_item)
+        print('explicit_image_user:')
+        print(explicit_image_user.shape)
         explicit_image_embeds = torch.cat([explicit_image_user, explicit_image_item], dim=0)
+        print("explicit_image_embeds:")
+        print(explicit_image_embeds.shape)
 
         explicit_text_item = self.conv_ii(self.text_original_adj, text_item_embeds)
+        print("explicit_text_item:")
+        print(explicit_text_item.shape)
         explicit_text_user = torch.sparse.mm(self.R, explicit_text_item)
+        print("explicit_text_user:")
+        print(explicit_text_user.shape)
         explicit_text_embeds = torch.cat([explicit_text_user, explicit_text_item], dim=0)
-       
+        print('explicit_text_embeds:')
+        print(explicit_text_embeds.shape)
        #扩展图id和项目项目图的嵌入进行乘积         
         fine_grained_image = torch.multiply((extended_id_embeds), (explicit_image_embeds)) 
         fine_grained_text = torch.multiply((extended_id_embeds), (explicit_text_embeds ))
         final_features = (fine_grained_image + fine_grained_text)
-        
+        print('final_features:')
+        print(final_features.shape)
         # random noise GCN for v and t
         self.v_rep_n1, _ = self.v_gcn_n1(self.edge_index_dropv, self.edge_index, self.v_feat, perturbed=True)
         self.t_rep_n1, _ = self.t_gcn_n1(self.edge_index_dropt, self.edge_index, self.t_feat, perturbed=True)
@@ -442,7 +467,8 @@ class MENTOR(GeneralRecommender):
 
         # v, v, id, and vt modalities
         representation = torch.cat((self.v_rep, self.t_rep,self.id_rep), dim=1)
-    
+        print("representation:")
+        print(representation.shape)
         # noise rep
         representation_n1 = torch.cat((self.v_rep_n1, self.t_rep_n1), dim=1)
         representation_n2 = torch.cat((self.v_rep_n2, self.t_rep_n2), dim=1)
@@ -453,7 +479,8 @@ class MENTOR(GeneralRecommender):
         user_rep = torch.cat((self.v_rep[:self.num_user], self.t_rep[:self.num_user],self.id_rep[:self.num_user]), dim=2)
         user_rep = self.weight_u.transpose(1, 2) * user_rep
         user_rep = torch.cat((user_rep[:, :, 0], user_rep[:, :, 1],user_rep[:,:,2]), dim=1)
-
+        print("user_rep:")
+        print(user_rep.shape)
         # noise rep1
         self.v_rep_n1 = torch.unsqueeze(self.v_rep_n1, 2)
         self.t_rep_n1 = torch.unsqueeze(self.t_rep_n1, 2)
@@ -478,6 +505,8 @@ class MENTOR(GeneralRecommender):
 
         user_rep = user_rep
         item_rep = item_rep + h    
+        print("item_rep:")
+        print(item_rep.shape)
     
         item_rep_n1 = item_rep_n1 + h_n1
         item_rep_n2 = item_rep_n2 + h_n2
@@ -485,10 +514,15 @@ class MENTOR(GeneralRecommender):
         # build result embedding
         self.user_rep = user_rep
         self.user_rep = torch.cat((self.user_rep,final_features[:self.n_users]),dim=1)
+        print("self.user_rep:")
+        print(self.user_rep.shape)
         self.item_rep = item_rep
         self.item_rep = torch.cat((self.item_rep,final_features[self.n_users:]),dim=1)
+        print("self.item_rep:")
+        print(self.item_rep.shape)
         self.result_embed = torch.cat((self.user_rep, self.item_rep), dim=0)
-    
+        print("self.result_embed:")
+        print(self.result_embed.shape)
         self.user_rep_n1 = user_rep_n1
         self.item_rep_n1 = item_rep_n1
         self.result_embed_n1 = torch.cat((user_rep_n1, item_rep_n1), dim=0)
